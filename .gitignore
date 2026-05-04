@@ -1,0 +1,17 @@
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+
+# --- Capture files ---
+*.pcap
+*.pcapng
+*.csv
+*.log
+
+# --- Results ---
+results/*
+
+# --- OS and vscode ---
+.DS_Store
+.vscode/
