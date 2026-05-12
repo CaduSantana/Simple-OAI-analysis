@@ -7,7 +7,7 @@ This repository contains the infrastructure and automation scripts to generate a
 The 5G Core and access network are orchestrated as Docker containers. The environment captures multi-layer traffic scenarios, integrating:
 1. **Realistic Benign Traffic:** traffic generated through large file transfers (TCP) and adaptive HTTPS video streaming using `yt-dlp`.
 2. **Conventional Cyberattacks:** TCP SYN, UDP, and ICMP flooding attacks launched from a dedicated Kali Linux node.
-3. **Core Vulnerability Exploitation:** exploitation of the documented vulnerability CVE-2025-65805.
+3. **Core Vulnerability Exploitation:** exploitation of the documented vulnerability [CVE-2025-65805](https://nvd.nist.gov/vuln/detail/CVE-2025-65805).
 
 ![Overview of the proposed 5G testbed architecture](figs/overview.png)
 
