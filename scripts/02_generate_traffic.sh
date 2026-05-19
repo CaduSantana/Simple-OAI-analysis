@@ -199,20 +199,20 @@ run_cve() {
 # ==========================================================================
 cleanup() {
   echo "[cleanup] Stopping processes and saving logs..."
-  if [[ -f "$TSHARK_PID_FILE" ]]; then
-    local pid; pid="$(cat "$TSHARK_PID_FILE")"
-    if kill -0 "$pid" 2>/dev/null; then sudo_run kill "$pid" || true; fi
-    rm -f "$TSHARK_PID_FILE"
-  fi
+  
+  sudo_run pkill -15 -f "tshark -i oaiworkshop" 2>/dev/null || true
+  
+  sleep 2 
+  rm -f "$TSHARK_PID_FILE" 2>/dev/null || true
 
-  # Removes the Sidecar (terminates all benign traffic flows together)
   docker rm -f "$TRAFFIC_GEN" >/dev/null 2>&1 || true
 
-  # Kills Kali processes silently to avoid terminal clutter
+  # Kills Kali processes
   docker exec oai-attacker pkill hping3 >/dev/null 2>&1 || true
   docker exec oai-attacker pkill nmap >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+
+trap cleanup EXIT INT TERM QUIT HUP
 
 # ==========================================================================
 # PRE-CHECKS
