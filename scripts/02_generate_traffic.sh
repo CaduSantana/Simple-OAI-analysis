@@ -129,7 +129,7 @@ start_benign_traffic() {
   docker exec -d "$TRAFFIC_GEN" bash -c "
     END=\$(( \$(date +%s) + ${duration} ))
     while [[ \$(date +%s) -lt \$END ]]; do
-      yt-dlp --source-address ${ue_ip} --format 'bestaudio[ext=m4a]' --output '/tmp/yt_%(id)s.%(ext)s' --no-playlist --quiet 'https://www.youtube.com/watch?v=jNQXAC9IVRw' 2>/dev/null || true
+      yt-dlp --source-address ${ue_ip} --format 'bestaudio[ext=m4a]' --output '/tmp/yt_%(id)s.%(ext)s' --no-playlist --quiet 'https://www.youtube.com/live/Nv4DRqrSilM?si=O4LOhJhXLcI532n7' 2>/dev/null || true
       rm -f /tmp/yt_*.m4a 2>/dev/null || true
       sleep 5
     done
